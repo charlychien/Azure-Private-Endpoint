@@ -6,9 +6,10 @@ A small Bash utility for **auditing and managing `privateEndpointNetworkPolicies
 
 The script runs three sequential steps:
 
-1. **List all Private Endpoints** across every accessible subscription (via Azure Resource Graph) and write them to `private-endpoints.tsv`. Each PE row includes its name, subscription id, resource-group id, subnet id, **private IP(s)**, and location.
-2. **Inspect each unique subnet** referenced by those PEs and fetch the current `privateEndpointNetworkPolicies` value. Results go to `subnet-pe-network-policies.tsv`.
+1. **List all Private Endpoints** across every accessible subscription (via Azure Resource Graph) and write them to `private-endpoints.tsv`. Each PE row includes its name, subscription id, resource-group id, subnet id, **private IP(s)**, the **Route Table ID** associated with its subnet (if any), and location.
+2. **Inspect each unique subnet** referenced by those PEs and fetch the current `privateEndpointNetworkPolicies` value **and the associated Route Table ID** (if any). Results go to `subnet-pe-network-policies.tsv`.
 3. **Reconcile** — find subnets whose policy ≠ `TARGET_POLICY` and (optionally) update them to `TARGET_POLICY`. By default this is a **dry-run**; set `APPLY=1` to actually apply changes.
+   - **Route-table gating**: when `TARGET_POLICY` requires UDR to be meaningful (`RouteTableEnabled` or `Enabled`), subnets that do **not** have a Route Table associated are **skipped** and listed separately, since flipping the policy on them would have no real effect until you also associate an RT.
 
 ## Why `privateEndpointNetworkPolicies` matters
 
@@ -79,18 +80,34 @@ Both files are tab-separated and overwritten on each run.
 | `ResourceGroupId` | Full `/subscriptions/.../resourceGroups/<name>` path |
 | `SubnetId` | Full subnet resource ID (may be in a different subscription) |
 | `PrivateIP` | One or more IPs assigned to the PE NIC, comma-separated (PEs with multiple sub-resources, e.g. AMPLS or Storage, will list each) |
+| `RouteTableId` | Full resource ID of the Route Table associated with the PE's subnet, or **empty** if the subnet has none. In the console table empty values are shown as `-`. |
 | `Location` | Azure region |
 
 ### `subnet-pe-network-policies.tsv`
 
 | Column | Notes |
 |---|---|
-| `SubnetId` | Each **unique** subnet referenced by a PE |
+| `SubnetId` | Each **unique** subnet referenced by a PE (lower-cased; Azure resource IDs are case-insensitive) |
 | `PrivateEndpointNetworkPolicies` | Current value (`Disabled`, `Enabled`, `NetworkSecurityGroupEnabled`, `RouteTableEnabled`, or `ERROR` if the lookup failed) |
+| `RouteTableId` | Full resource ID of the associated Route Table, or **empty** if the subnet has none. In the console table empty values are shown as `-` for readability. |
 
 ## Step 3 console output
 
-Step 3 prints two summary blocks at the end of an `APPLY=1` run:
+During a dry-run (or `APPLY=1`), Step 3 first shows what it intends to do:
+
+```
+Skipping N subnet(s) without an associated Route Table (target=RouteTableEnabled needs UDR):
+  ~ <subnet id>  (current: <policy>, no route table)
+  ...
+
+Found M subnet(s) where policy != <TARGET_POLICY> and (route table present or not required):
+  - <subnet id>  (current: <policy>)
+  ...
+```
+
+Legend: `~` = skipped due to missing Route Table, `-` = candidate that will be updated when `APPLY=1`.
+
+When `APPLY=1` it then prints two summary blocks:
 
 ```
 ----- Modified Subnets (N) -----
@@ -106,6 +123,7 @@ The script always exits 0 even when individual subnet updates fail, so check the
 ## Safety notes
 
 - **Idempotent**: subnets already at `TARGET_POLICY` are skipped (Step 3 prints `All subnets already set to ... Nothing to change.`).
+- **No no-op updates**: when target needs UDR (`RouteTableEnabled` / `Enabled`), subnets without an associated Route Table are skipped (listed with `~`). Associate an RT first, then re-run.
 - **`set -euo pipefail`** — the script aborts on unexpected errors.
 - **Dry-run by default** — you must explicitly opt in with `APPLY=1`.
 - **Changing this setting affects live traffic.** Moving from `Disabled` to `Enabled` (or `NetworkSecurityGroupEnabled`) can break existing PE traffic if NSGs in the subnet do not permit it. Validate NSG/UDR before applying broadly.
